@@ -1,5 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 fastapi
 uvicorn
 torch
-silero
 soundfile
+pydantic
+omegaconf
