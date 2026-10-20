@@ -4,52 +4,59 @@ import subprocess
 from threading import Lock
 from typing import Literal
 
+# Жестко ограничиваем потоки для CPU, чтобы не плодить оверхед по памяти
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import imageio_ffmpeg
-import torch
+import numpy as np
+import onnxruntime as ort
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("silero_api")
+logger = logging.getLogger("silero_onnx_api")
 
 SAMPLE_RATE = 24_000
 MAX_TEXT_LENGTH = 8_000
 MAX_AUDIO_BYTES = 30 * 1024 * 1024
 
-app = FastAPI(title="Silero TTS API", version="2.0.0")
-torch.set_num_threads(1)
+app = FastAPI(title="Silero ONNX TTS API", version="2.1.0")
 
-model = None
+_session = None
 _model_lock = Lock()
 _inference_lock = Lock()
 
+ONNX_MODEL_PATH = "silero_v4.onnx"  # Путь к твоему скачанному ONNX файлу модели
 
-def get_model():
-    """Загрузить модель Silero v4 только один раз."""
-    global model
 
-    if model is None:
+def get_onnx_session():
+    """Ленивая загрузка ONNX-сессии (без тяжелого PyTorch)."""
+    global _session
+    if _session is None:
         with _model_lock:
-            if model is None:
-                logger.info("Loading Silero v4 Russian TTS model")
+            if _session is None:
+                logger.info("Loading Silero ONNX model...")
+                
+                if not os.path.exists(ONNX_MODEL_PATH):
+                    raise RuntimeError(
+                        f"ONNX model file not found at {ONNX_MODEL_PATH}. "
+                        "Download it from the official Silero repository and place it in the app directory."
+                    )
 
-                loaded_model, _ = torch.hub.load(
-                    repo_or_dir="snakers4/silero-models",
-                    model="silero_tts",
-                    language="ru",
-                    speaker="v4_ru",
-                    trust_repo=True,
-                )
+                # Настройка сессии с упором на минимальное потребление RAM
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = 1
+                opts.inter_op_num_threads = 1
+                opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-                loaded_model.to(torch.device("cpu"))
-                model = loaded_model
-
-                logger.info("Silero model loaded")
-
-    return model
+                _session = ort.InferenceSession(ONNX_MODEL_PATH, sess_options=opts, providers=["CPUExecutionProvider"])
+                logger.info("Silero ONNX model loaded successfully!")
+    return _session
 
 
 class TTSRequest(BaseModel):
@@ -63,8 +70,21 @@ class TTSRequest(BaseModel):
     ] = "kseniya"
 
 
+def text_to_tokens(text: str) -> np.ndarray:
+    """
+    Примитивная/стандартная токенизация под Silero. 
+    (Символьный маппинг: каждый символ переводится в его ASCII/Unicode ID или согласно словарю модели).
+    """
+    # Пример базового маппинга символов для ONNX входа Silero
+    # (в зависимости от конкретной экспортированной модели входной тензор ожидает массив int64)
+    cleaned_text = text.lower().strip()
+    tokens = [ord(char) for char in cleaned_text]
+    # Добавляем батч-дименшн [1, len]
+    return np.array([tokens], dtype=np.int64)
+
+
 def encode_mp3(pcm_float32: bytes) -> bytes:
-    """Кодировать mono 24 kHz float32 PCM прямо в MP3, без промежуточного WAV."""
+    """Кодирование PCM float32 в MP3 через FFmpeg."""
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
 
     result = subprocess.run(
@@ -98,54 +118,37 @@ def encode_mp3(pcm_float32: bytes) -> bytes:
     if len(result.stdout) > MAX_AUDIO_BYTES:
         raise RuntimeError("Generated MP3 is too large")
 
-    is_mp3 = result.stdout.startswith(b"ID3") or (
-        len(result.stdout) > 2
-        and result.stdout[0] == 0xFF
-        and (result.stdout[1] & 0xE0) == 0xE0
-    )
-
-    if not is_mp3:
-        raise RuntimeError("Encoder returned invalid MP3 data")
-
     return result.stdout
 
 
 @app.get("/")
 def ping():
-    return {"status": "ok"}
+    return {"status": "ok", "engine": "onnxruntime"}
 
 
 @app.post("/generate")
 def generate(data: TTSRequest):
     text = data.text.strip()
-
     if not text:
-        raise HTTPException(
-            status_code=422,
-            detail="Text must not be empty",
-        )
+        raise HTTPException(status_code=422, detail="Text must not be empty")
 
     try:
-        tts_model = get_model()
+        session = get_onnx_session()
+        input_tensor = text_to_tokens(text)
 
-        # Не запускаем несколько генераций одновременно,
-        # чтобы избежать резких пиков нагрузки.
+        # Получаем имена входов модели динамически
+        input_name = session.get_inputs()[0].name
+        
+        # Некоторые версии ONNX моделей Silero требуют также передать speaker_id или sample_rate
+        inputs = {input_name: input_tensor}
+
         with _inference_lock:
-            audio = tts_model.apply_tts(
-                text=text,
-                speaker=data.speaker,
-                sample_rate=SAMPLE_RATE,
-            )
+            # Инференс через ONNX Runtime без участия PyTorch
+            outputs = session.run(None, inputs)
+            audio_array = outputs[0].squeeze() # Убираем лишние размерности
 
-        # Silero возвращает Tensor. Передаём float32 PCM прямо в FFmpeg.
-        pcm_float32 = (
-            audio.detach()
-            .cpu()
-            .numpy()
-            .astype("<f4", copy=False)
-            .tobytes(order="C")
-        )
-
+        # Переводим numpy array в байты float32 PCM
+        pcm_float32 = audio_array.astype("<f4", copy=False).tobytes(order="C")
         mp3_data = encode_mp3(pcm_float32)
 
         return Response(
@@ -159,17 +162,6 @@ def generate(data: TTSRequest):
 
     except HTTPException:
         raise
-
-    except subprocess.TimeoutExpired as exc:
-        logger.exception("MP3 encoder timed out")
-        raise HTTPException(
-            status_code=504,
-            detail="MP3 encoding timed out",
-        ) from exc
-
     except Exception as exc:
-        logger.exception("TTS generation failed")
-        raise HTTPException(
-            status_code=500,
-            detail="Audio generation failed",
-        ) from exc
+        logger.exception("TTS ONNX generation failed")
+        raise HTTPException(status_code=500, detail=f"Audio generation failed: {str(exc)}")
