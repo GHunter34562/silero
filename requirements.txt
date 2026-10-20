@@ -1,8 +1,7 @@
---extra-index-url https://download.pytorch.org/whl/cpu
 fastapi
 uvicorn
-torch
+onnxruntime
+numpy
 soundfile
 pydantic
-omegaconf
 imageio-ffmpeg==0.6.0
