@@ -5,3 +5,4 @@ torch
 soundfile
 pydantic
 omegaconf
+imageio-ffmpeg==0.6.0
