@@ -27,32 +27,36 @@ MAX_AUDIO_BYTES = 15 * 1024 * 1024
 
 model = None
 
-# Загружаем модель прямо при старте приложения, чтобы видеть реальную ошибку в логах хоста
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model
     try:
-        logger.info("Starting up and loading Silero model...")
+        logger.info("Setting up Silero model (Direct Download mode)...")
         os.makedirs("/tmp/torch", exist_ok=True)
+        model_path = "/tmp/torch/v4_ru.pt"
         
-        loaded_model, _ = torch.hub.load(
-            repo_or_dir="snakers4/silero-models",
-            model="silero_tts",
-            language="ru",
-            speaker="v4_ru",
-            trust_repo=True,
-        )
+        # Скачиваем модель напрямую по ссылке, минуя git и torch.hub.load
+        if not os.path.isfile(model_path):
+            logger.info("Downloading v4_ru.pt from official Silero repository...")
+            torch.hub.download_url_to_file(
+                "https://models.silero.ai/models/tts/ru/v4_ru.pt",
+                model_path
+            )
+            logger.info("Model downloaded successfully.")
+
+        logger.info("Loading model via PackageImporter...")
+        loaded_model = torch.package.PackageImporter(model_path).load_pickle("tts_models", "model")
         loaded_model.to(torch.device("cpu"))
         loaded_model.eval()
+        
         model = loaded_model
-        logger.info("Silero model loaded successfully during startup!")
+        logger.info("Silero model loaded and ready!")
+        
     except Exception as e:
-        logger.error(f"CRITICAL: Failed to load model at startup: {e}", exc_info=True)
-        # Не падаем наглухо при старте, чтобы хост не ушел в бесконечный рестартный цикличный шторм,
-        # но модель останется None
+        logger.error(f"CRITICAL: Failed to load model: {e}", exc_info=True)
     yield
 
-app = FastAPI(title="Silero TTS Startup Debug API", version="2.1.2", lifespan=lifespan)
+app = FastAPI(title="Silero TTS Direct API", version="2.1.3", lifespan=lifespan)
 
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
@@ -106,7 +110,7 @@ def generate(data: TTSRequest):
     if model is None:
         raise HTTPException(
             status_code=500, 
-            detail="Model is not loaded. Check hosting startup logs for torch.hub.load errors."
+            detail="Model is not loaded. Check hosting startup logs."
         )
 
     text = data.text.strip()
