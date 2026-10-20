@@ -6,24 +6,23 @@ import soundfile as sf
 
 app = FastAPI()
 
-# Ограничиваем CPU, чтобы не выходить за рамки бесплатного тарифа
+# Ограничиваем потоки процессора
 torch.set_num_threads(2)
 
-# Загружаем модель Silero v5 с trust_repo=True, чтобы деплой на Render не падал
+# Загружаем более легкую модель v4
 model, _ = torch.hub.load(
     repo_or_dir='snakers4/silero-models',
     model='silero_tts',
     language='ru',
-    speaker='v5_4_ru',
+    speaker='v4_ru',
     trust_repo=True
 )
 model.to(torch.device('cpu'))
 
 class TTSRequest(BaseModel):
     text: str
-    speaker: str = "kseniya" # Доступные голоса: kseniya, baya, xenia, eugene, aidar
+    speaker: str = "kseniya"
 
-# Пинг-эндпоинт, чтобы сервер не уходил в спячку каждые 15 минут
 @app.get("/")
 def ping():
     return {"status": "ok"}
